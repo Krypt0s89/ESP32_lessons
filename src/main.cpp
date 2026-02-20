@@ -7,6 +7,7 @@
 
 // Подключение стандартной библиотеки ввода-вывода
 #include <stdio.h>
+#include <math.h>
 
 // Подключение драйвера I2C из ESP-IDF
 #include "driver/i2c.h"
@@ -14,11 +15,13 @@
 // Подключение FreeRTOS (для задержек)
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-
+#include "freertos/semphr.h"
 
 
 #include "WiFiManager/WiFiManager.hpp"
 #include "HttpClient/HttpClient.hpp"
+
+SemaphoreHandle_t xTemperatureMutex;
 
 // I2C
 #define I2C_MASTER_NUM I2C_NUM_0       // Номер I2C
@@ -41,16 +44,20 @@ void telegram_task(void *pvParameters) {
     HttpClient http;
     std::string token = "8438508129:AAEaH39kNp5BDXTvC4kqovybLFZxN0M1IlA";
     std::string chat_id = "349691021";
-    
-    std::string curr_temp = "Room temperature is: " + std::to_string(current_temperature) + "°C";
-   
+    std::string curr_temp = ""; // Локальная переменная для хранения строки с температурой
+    if (xSemaphoreTake(xTemperatureMutex, portMAX_DELAY) == pdTRUE) {
+        float temp_temperature = round(current_temperature * 100.0) / 100.0;
+        curr_temp = "Room temperature is: " + std::to_string(temp_temperature) + "°C";
+        xSemaphoreGive(xTemperatureMutex);
+    }
+     // Округление до 2 знаков после запятой
     // std::stringstream stream;
     // stream << std::fixed << std::setprecision(2) << current_temperature;
     // std::string curr_temp = "Room temperature is: " + stream.str() + "C"; // Returns "x.xx" format
 
     http.sendTelegramMessage(token, chat_id, curr_temp);
 
-    vTaskDelete(NULL); 
+    vTaskDelay(pdMS_TO_TICKS(60000)); // Отправляем сообщение каждые 60 секунд
 }
 
 
@@ -77,7 +84,7 @@ void mpu6050_write_byte(uint8_t reg, uint8_t data)
                                pdMS_TO_TICKS(100));
 }
 
-void mpu6050_read_temp()
+void mpu6050_read_temp(void *pvParameters)
 {
     uint8_t data[2]; // Буфер
 
@@ -87,8 +94,15 @@ void mpu6050_read_temp()
                                      pdMS_TO_TICKS(100)) == ESP_OK)
     {
         int16_t raw = (data[0] << 8) | data[1];     // Объединение байт
+        if (xSemaphoreTake(xTemperatureMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+            current_temperature = (raw / 340.0) + 36.53; // Формула из даташита
+            xSemaphoreGive(xTemperatureMutex);
+        }
         current_temperature = (raw / 340.0) + 36.53; // Формула из даташита
+        ESP_LOGI(TAG, "Temp: %.2f C", current_temperature);
     }
+
+    vTaskDelay(pdMS_TO_TICKS(5000));
 }
 
 
@@ -97,33 +111,21 @@ void mpu6050_read_temp()
 
 
 extern "C" void app_main(void) {
+    xTemperatureMutex = xSemaphoreCreateMutex(); // Инициализация мьютекса для температуры
 
     i2c_master_init();                 // I2C старт
     mpu6050_write_byte(MPU6050_PWR_MGMT_1, 0); // Выход из sleep
 
     WiFiManager wifi("Kryptos", "13572468");
-
-
- while (1)
-    {
-        mpu6050_read_temp();          // Чтение температуры
-        ESP_LOGI(TAG, "Temp: %.2f C", current_temperature);
-              
-        //vTaskDelay(pdMS_TO_TICKS(5000)); // Задержка 5 сек
+    // // Запуск задачи чтения температуры на Core 1
+    xTaskCreatePinnedToCore(mpu6050_read_temp, "reading_task", 2048, NULL, 2, NULL, 1);
     
-
-
-
-
-
-
-        if (wifi.connect() == ESP_OK) {
+    if (wifi.connect() == ESP_OK) {
+        printf("We connected\n");
+        
         HttpClient http;
-        xTaskCreate(telegram_task, "telegram_task", 8192, NULL, 5, NULL);
-        vTaskDelay(pdMS_TO_TICKS(15000)); // Задержка 15 сек
+        xTaskCreate(telegram_task, "telegram_task", 8192, NULL, 2, NULL);
         }
-  
-    }
 }
 
 
